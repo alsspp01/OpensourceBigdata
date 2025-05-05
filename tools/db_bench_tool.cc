@@ -39,6 +39,8 @@
 #include <thread>
 #include <unordered_map>
 
+#include <limits>
+
 #include "db/db_impl/db_impl.h"
 #include "db/malloc_stats.h"
 #include "db/version_set.h"
@@ -154,6 +156,7 @@ DEFINE_string(
     "randomtransaction,"
     "randomreplacekeys,"
     "timeseries,"
+    "timeseriessession,"
     "getmergeoperands,"
     "readrandomoperands,"
     "backup,"
@@ -303,6 +306,15 @@ DEFINE_int32(threads, 1, "Number of concurrent threads to run.");
 DEFINE_int32(duration, 0,
              "Time in seconds for the random-ops tests to run."
              " When 0 then num & reads determine the test duration");
+
+DEFINE_int32(session_duration, 100,
+              "Time in seconds for the single session to be alive"
+              " When 0 then session_writes determine the session duration");
+ 
+DEFINE_int32(session_writes,std::numeric_limits<int32_t>::max() ,
+                "max number of write for single session"
+                "defaults to maximam value of int32");
+   
 
 DEFINE_string(value_size_distribution_type, "fixed",
               "Value size distribution type: fixed, uniform, normal");
@@ -1278,11 +1290,6 @@ DEFINE_bool(
 DEFINE_bool(explicit_snapshot, false,
             "When set to true iterators will be initialized with explicit "
             "snapshot");
-
-DEFINE_uint32(memtable_op_scan_flush_trigger,
-              ROCKSDB_NAMESPACE::AdvancedColumnFamilyOptions()
-                  .memtable_op_scan_flush_trigger,
-              "Setting for CF option memtable_op_scan_flush_trigger.");
 
 static enum ROCKSDB_NAMESPACE::CompressionType StringToCompressionType(
     const char* ctype) {
@@ -3724,7 +3731,21 @@ class Benchmark {
         }
         fresh_db = true;
         method = &Benchmark::TimeSeries;
-      } else if (name == "block_cache_entry_stats") {
+      }else if (name=="timeseriessession") {
+        timestamp_emulator_.reset(new TimestampEmulator());
+        fresh_db=true;
+        method = &Benchmark::TimeSeriesSession;
+
+      }else if (name=="timeseriesmerge"){
+        if (FLAGS_merge_operator.empty()) {
+          fprintf(stdout, "%-12s : skipped (--merge_operator is unknown)\n",
+                  name.c_str());
+          exit(1);
+        }
+        timestamp_emulator_.reset(new TimestampEmulator());
+        fresh_db=true;
+        method = &Benchmark::TimeSeriesMerge;
+      }else if (name == "block_cache_entry_stats") {
         // DB::Properties::kBlockCacheEntryStats
         PrintStats("rocksdb.block-cache-entry-stats");
       } else if (name == "cache_report_problems") {
@@ -4752,8 +4773,6 @@ class Benchmark {
     options.block_protection_bytes_per_key =
         FLAGS_block_protection_bytes_per_key;
     options.paranoid_memory_checks = FLAGS_paranoid_memory_checks;
-    options.memtable_op_scan_flush_trigger =
-        FLAGS_memtable_op_scan_flush_trigger;
   }
 
   void InitializeOptionsGeneral(Options* opts, ToolHooks& hooks) {
@@ -8308,6 +8327,115 @@ class Benchmark {
       thread->stats.Report("timeseries write");
     }
   }
+
+  std::atomic<int64_t> sessionid=0;
+  void TimeSeriesSession(ThreadState *thread){
+    RandomGenerator gen;
+    int64_t bytes = 0;
+
+    std::unique_ptr<const char[]> key_guard;
+    Slice key = AllocateKey(&key_guard);
+
+    Duration duration(FLAGS_duration, writes_);
+    Duration session_duration(FLAGS_session_duration,FLAGS_session_writes);
+    int64_t current_sessionid=sessionid++;
+    while (!duration.Done(1)) {
+      if(session_duration.Done(1)){
+        current_sessionid=sessionid++;
+        session_duration=Duration(FLAGS_session_duration,FLAGS_session_writes);
+      }
+      
+
+      DB* db = SelectDB(thread);
+
+      GenerateKeyFromInt(current_sessionid, FLAGS_num, &key);
+
+      // Write timestamp
+
+      char* start = const_cast<char*>(key.data());
+      char* pos = start + 8;
+      int bytes_to_fill =
+          std::min(key_size_ - static_cast<int>(pos - start), 8);
+      uint64_t timestamp_value = timestamp_emulator_->Get();
+      if (port::kLittleEndian) {
+        for (int i = 0; i < bytes_to_fill; ++i) {
+          pos[i] = (timestamp_value >> ((bytes_to_fill - i - 1) << 3)) & 0xFF;
+        }
+      } else {
+        memcpy(pos, static_cast<void*>(&timestamp_value), bytes_to_fill);
+      }
+
+      timestamp_emulator_->Inc();
+
+      Status s;
+      Slice val = gen.Generate();
+      s = db->Put(write_options_, key, val);
+
+      if (!s.ok()) {
+        fprintf(stderr, "put error: %s\n", s.ToString().c_str());
+        ErrorExit();
+      }
+      bytes = key.size() + val.size();
+      thread->stats.FinishedOps(&db_, db_.db, 1, kWrite);
+      thread->stats.AddBytes(bytes);
+
+    }
+  }
+  void TimeSeriesMerge(ThreadState* thread) {
+    RandomGenerator gen;
+    int64_t bytes = 0;
+    std::unique_ptr<const char[]> key_guard;
+    Slice key = AllocateKey(&key_guard);
+    // The number of iterations is the larger of read_ or write_
+    Duration duration(FLAGS_duration, readwrites_);
+
+    Duration session_duration(FLAGS_session_duration,FLAGS_session_writes);
+    int64_t current_sessionid=sessionid++;
+    while (!duration.Done(1)) {
+      DB* db = SelectDB(thread);
+      if(session_duration.Done(1)){
+        current_sessionid=sessionid++;
+        session_duration=Duration(FLAGS_session_duration,FLAGS_session_writes);
+      }
+    
+      GenerateKeyFromInt(current_sessionid, FLAGS_num, &key);
+
+      uint64_t timestamp_value = timestamp_emulator_->Get();
+      
+      Status s;
+      Slice val = gen.Generate();
+
+      char* start = const_cast<char*>(val.data());
+      
+      int bytes_to_fill =
+          std::min<decltype(value_size)>(value_size, 8);
+      if (port::kLittleEndian) {
+        for (int i = 0; i < bytes_to_fill; ++i) {
+          start[i] = (timestamp_value >> ((bytes_to_fill - i - 1) << 3)) & 0xFF;
+        }
+      } else {
+        memcpy(start, static_cast<void*>(&timestamp_value), bytes_to_fill);
+      }
+
+      timestamp_emulator_->Inc();
+
+      s=db->Merge(write_options_,key,val);
+
+      if (!s.ok()) {
+        fprintf(stderr, "merge error: %s\n", s.ToString().c_str());
+        exit(1);
+      }
+      bytes += key.size() + val.size();
+      thread->stats.FinishedOps(&db_, db_.db, 1, kMerge);
+    }
+
+    // Print some statistics
+    char msg[100];
+    snprintf(msg, sizeof(msg), "( updates:%" PRIu64 ")", readwrites_);
+    thread->stats.AddBytes(bytes);
+    thread->stats.AddMessage(msg);
+  }
+
 
   void Compact(ThreadState* thread) {
     DB* db = SelectDB(thread);
